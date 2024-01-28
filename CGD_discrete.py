@@ -14,18 +14,12 @@ from metrics.train_metrics import TrainLossDiscrete
 from metrics.abstract_metrics import SumExceptBatchMetric, SumExceptBatchKL, NLL
 from src import utils
 
-"""
-整个代码的逻辑是使用mask标记填充的位置，不对其进行计算，这样不会改变图的结构，但是会改变图的特征
-严格基于原图结构进行生成,不会自动增添新的节点和边。
-所以只需要增加对Y的计算部分即可
-"""
-#继承自lightning的模型类
+
 class DiscreteDenoisingDiffusion(pl.LightningModule):
     def __init__(self, cfg, dataset_infos, train_metrics, sampling_metrics, visualization_tools, extra_features,
                  domain_features):
         super().__init__()
 
-        #input_dims和output_dims是当前数据集的X，E，y的分类数量(即维度)
         #dist->distribution
         input_dims = dataset_infos.input_dims
         output_dims = dataset_infos.output_dims
@@ -46,28 +40,25 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
 
         self.dataset_info = dataset_infos
 
-        #TrainLossDiscrete中包含了X和E以及Y的损失计算,不需要额外添加
         self.train_loss = TrainLossDiscrete(self.cfg.model.lambda_train)
 
-        #PyToch Lightning的指标计算，获取以评估模型性能，这里添加对Y的指标计算!!
         self.val_nll = NLL()
         self.val_X_kl = SumExceptBatchKL()
         self.val_E_kl = SumExceptBatchKL()
-        self.val_Y_kl = SumExceptBatchKL()#这里添加对Y的指标计算!!
+        self.val_Y_kl = SumExceptBatchKL()
         self.val_X_logp = SumExceptBatchMetric()
         self.val_E_logp = SumExceptBatchMetric()
-        self.val_Y_logp = SumExceptBatchMetric()#这里添加对Y的指标计算!!
+        self.val_Y_logp = SumExceptBatchMetric()
         
 
         self.test_nll = NLL()
         self.test_X_kl = SumExceptBatchKL()
         self.test_E_kl = SumExceptBatchKL()
-        self.text_Y_kl = SumExceptBatchKL()#这里添加对Y的指标计算!!
+        self.text_Y_kl = SumExceptBatchKL()
         self.test_X_logp = SumExceptBatchMetric()
         self.test_E_logp = SumExceptBatchMetric()
-        self.text_Y_kl = SumExceptBatchMetric()#这里添加对Y的指标计算!!
+        self.text_Y_kl = SumExceptBatchMetric()
 
-        #训练和采样的指标计算，获取以评估模型性能
         self.train_metrics = train_metrics
         self.sampling_metrics = sampling_metrics
 
@@ -83,17 +74,11 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
                                       act_fn_in=nn.ReLU(),
                                       act_fn_out=nn.ReLU())
 
-        #两种噪声调度方案，一种是custom, 一种是cosine
         self.noise_schedule = PredefinedNoiseScheduleDiscrete(cfg.model.diffusion_noise_schedule,
                                                               timesteps=cfg.model.diffusion_steps)
         
-        #两种转移矩阵，一种是各个状态均匀分布，一种是按照真实分布转移
-        #将两种分布作为可能的转移概率矩阵，设置不同的转移概率矩阵以控制x，e，y向设定的分布转移，获得转移概率q(x_t|x_t+1)和q(e_t|e_t+1)
-        #limit_dist部分使用KL散度计算模型预测结果与它们的差距，一种是平均, 一种是按照真实分布概率转移
-        #在社区搜索任务中，我们需要设定为按照真实分布转移
 
         if cfg.model.transition == 'uniform':
-            #DiscreteUniformTransition是一个类，用于计算转移概率矩阵
             self.transition_model = DiscreteUniformTransition(x_classes=self.Xdim_output, e_classes=self.Edim_output,
                                                               y_classes=self.ydim_output)
             x_limit = torch.ones(self.Xdim_output) / self.Xdim_output
@@ -101,17 +86,10 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
             y_limit = torch.ones(self.ydim_output) / self.ydim_output
             self.limit_dist = utils.PlaceHolder(X=x_limit, E=e_limit, y=y_limit)
         elif cfg.model.transition == 'marginal':
-            '''
-                获得y的真实边缘分布(之前是均匀分布作为边缘分布)
-                先要去数据加载部分计算数据集中y的分布，然后计算y的边缘分布
-            '''
             node_types = self.dataset_info.node_types.float()
             x_marginals = node_types / torch.sum(node_types)
             edge_types = self.dataset_info.edge_types.float()
             e_marginals = edge_types / torch.sum(edge_types)
-            ######################需要去dataset_info里面设置获取y的类型#############################
-            #dataset_info根据数据集的不同，有不同的设置，需要针对当前的数据集进行设置
-            #需要增加y的边缘分布
             label_types = self.dataset_info.label_types.float()
             y_marginals = label_types / torch.sum(label_types) 
             #print(f"Marginal distribution of the classes: {x_marginals} for nodes, {e_marginals} for edges")
@@ -124,9 +102,6 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
             #                                    y=torch.ones(self.ydim_output) / self.ydim_output)
             self.limit_dist = utils.PlaceHolder(X=x_marginals, E=e_marginals,
                                                 y=y_marginals)
-
-        #从优化内存占用、解耦合、序列化与加载、代码简洁性等方面考虑
-        #将指标对象从保存内容中排除。只保存与模型训练直接相关的超参数配置
         self.save_hyperparameters(ignore=[train_metrics, sampling_metrics])
         self.start_epoch_time = None
         self.train_iterations = None
@@ -135,30 +110,19 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
         self.number_chain_steps = cfg.general.number_chain_steps
         self.best_val_nll = 1e8
         self.val_counter = 0
-
-    #pytorh-lightning的训练循环
     def training_step(self, data, i):
         if data.edge_index.numel() == 0:
             print("Found a batch with no edges. Skipping.")
             return
-        #将稀疏数据转换为稠密数据,让所有图的batch的图矩阵形状一样，不足的节点用0填充,生成一个(图数，最大节点数，最大节点数)的矩阵
-        #就是所有图按照最大节点数进行填充，不足的节点用0填充
-        #node_mask记录了哪些节点是真实节点，哪些是填充节点
+
         dense_data, node_mask = utils.to_dense(data.x, data.edge_index, data.edge_attr, data.batch)
-        #根据node_mask,进一步进行mask，得到真实的节点数
-        #尽管已经置0,进行mask操作仍有优化表示、减少干扰、提高灵活性等好处
-        #X,E是矩阵，y是一维向量,不需要填充
+
         dense_data = dense_data.mask(node_mask)
         X, E = dense_data.X, dense_data.E
-        "注意apply_noise操作仍然只对非填充节点进行操作，填充节点不进行操作!生成的噪声图仍然是跟原图结构一致"
         noisy_data = self.apply_noise(X, E, data.y, node_mask)
         extra_data = self.compute_extra_data(noisy_data)
 
-        #forward就是把噪声数据和额外的特征要求传入graph transformer model，得到预测结果
-        #预测也只对非填充节点进行操作，填充节点不进行操作
         pred = self.forward(noisy_data, extra_data, node_mask)
-        #这里直接(在原图上对于已有的节点，不改变结构！！)给噪声然后预测真值，在采样的时候就可以用这个预测的真值，计算t-1时刻的采样
-        #true_X, true_E, true_y同时作为真值与预测值做loss计算,不需要修改
         loss = self.train_loss(masked_pred_X=pred.X, masked_pred_E=pred.E, pred_y=pred.y,
                                true_X=X, true_E=E, true_y=data.y,
                                log=i % self.log_every_steps == 0)
@@ -444,32 +408,24 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
 
         # Sample a timestep t.
         # When evaluating, the loss for t=0 is computed separately
-        #随机采样一个时间步t_int。在训练模式下，从0到self.T（包括0和self.T）之间的整数随机抽取；在评估模式下，从1到self.T之间的整数随机抽取。
         lowest_t = 0 if self.training else 1
         t_int = torch.randint(lowest_t, self.T + 1, size=(X.size(0), 1), device=X.device).float()  # (bs, 1)
         s_int = t_int - 1
-        
-        #转换成比例形式
         t_float = t_int / self.T
         s_float = s_int / self.T
 
         # beta_t and alpha_s_bar are used for denoising/loss computation
-        #按照预设的noise_schedule计算当前时刻t的噪声比例
         beta_t = self.noise_schedule(t_normalized=t_float)                         # (bs, 1)
         alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized=s_float)      # (bs, 1)
         alpha_t_bar = self.noise_schedule.get_alpha_bar(t_normalized=t_float)      # (bs, 1)
-
-        #Qtb是初始时间步到当前t的转移矩阵
-        #这里需要加入对y的转移矩阵
+        
         Qtb = self.transition_model.get_Qt_bar(alpha_t_bar, device=self.device)  # (bs, dx_in, dx_out), (bs, de_in, de_out)
         assert (abs(Qtb.X.sum(dim=2) - 1.) < 1e-4).all(), Qtb.X.sum(dim=2) - 1
         assert (abs(Qtb.E.sum(dim=2) - 1.) < 1e-4).all()
 
         # Compute transition probabilities
-        # 得到X和E的在当前时刻可能的分类概率
         probX = X @ Qtb.X  # (bs, n, dx_out)
         probE = E @ Qtb.E.unsqueeze(1)  # (bs, n, n, de_out)
-        #sampled_t是在当前时刻t的采样结果,即生成的噪声图
         sampled_t = diffusion_utils.sample_discrete_features(probX=probX, probE=probE, node_mask=node_mask)
 
         X_t = F.one_hot(sampled_t.X, num_classes=self.Xdim_output)
@@ -492,12 +448,9 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
        """
         t = noisy_data['t']
 
-        # 1.node
-        #log_pN是当前时刻t的节点数的概率分布，越小说明当前时刻的图在节点数量方面越接近于初始图
         N = node_mask.sum(1).long()
         log_pN = self.node_dist.log_prob(N)
 
-        #q(z_T | x)条件概率分布, p(z_T) = Uniform(1/num_classes)先验概率分布(当前假设为均匀分布)，计算两者的KL散度,应该接近0
         # 2. The KL between q(z_T | x) and p(z_T) = Uniform(1/num_classes). Should be close to zero.
         kl_prior = self.kl_prior(X, E, node_mask)
 
@@ -535,21 +488,6 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
     #逆向扩散，生成步骤！！！！！
     def sample_batch(self, batch_id: int, batch_size: int, keep_chain: int, number_chain_steps: int,
                      save_final: int, num_nodes=None):
-        """
-        :param batch_id: int
-        :param batch_size: int
-        :param num_nodes: int, <int>tensor (batch_size) (optional) for specifying number of nodes
-        :param save_final: int: number of predictions to save to file
-        :param keep_chain: int: number of chains to save to file
-        :param keep_chain_steps: number of timesteps to save for each chain
-        :return: molecule_list. Each element of this list is a tuple (atom_types, charges, positions)
-        既然主要代码逻辑不生成新结构，那么为什么还要设定生成的节点数？
-        （因为正常来说是按照原节点生成，如果设定了节点数应该是在原图中不足的进行填充，设定的n_nodes是作为n_max并根据其填充
-        填充的都是0节点，方便统一计算，实际上只有非填充节点才参与计算，不影响结果？）
-        """
-        #调用sample_batch部分需要修改，传入类型为tensor的num_nodes
-        #(不需要修改！)正常情况下按照给出的节点数进行生成，如果没有给出节点数，则按照数据集分布进行随机生成
-        #这样就与原图节点一致
         if num_nodes is None:
             n_nodes = self.node_dist.sample_n(batch_size, self.device)
         elif type(num_nodes) == int:
@@ -572,53 +510,18 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
                     [True, True, True, False, False],
                     [True, True, True, True, True]])
         """
-        # TODO: how to move node_mask on the right device in the multi-gpu case?
-        # TODO: everything else depends on its device
-        # Sample noise  -- z has size (n_samples, n_nodes, n_features)
-        '''
-        这里limit_dist就把它看作ground-truth distribution或者叫目标分布,根据真实分布生成噪声图
-        马尔可夫链中，一个常见的问题是当时间趋于无穷时，随机过程的状态将会趋向于哪里。
-        这被称为该随机过程的稳定分布或者极限分布（limiting distribution）。
-        '''
-        #生成噪声，一步完成，不需要迭代
-        #这里的sample_discrete_feature_noise中y是一个全0的向量,需要将其改为按照数据集真实采样
-        #已完成修改，z_T.X, z_T.E, z_T.y都是one-hot向量
         z_T = diffusion_utils.sample_discrete_feature_noise(limit_dist=self.limit_dist, node_mask=node_mask)
         X, E, y = z_T.X, z_T.E, z_T.y
 
-        #检查E是否是一个对称的张量
         assert (E == torch.transpose(E, 1, 2)).all()
         assert number_chain_steps < self.T
         
-        #按照采样链长度、保存链数和原始图大小定义，生成保存采样结果的张量
-        #还需要加入chian_Y!!
         chain_X_size = torch.Size((number_chain_steps, keep_chain, X.size(1)))
         chain_E_size = torch.Size((number_chain_steps, keep_chain, E.size(1), E.size(2)))
 
         chain_X = torch.zeros(chain_X_size)
         chain_E = torch.zeros(chain_E_size)
 
-        #注意这里的采用过程不会直接改变原始图的结构，论文中是设置分类结果可能为空，来生成新的结构
-        #采样通过循环迭代
-        # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
-        #s是当前时刻，t是上一时刻
-        """
-        eg:
-        self.T = 10
-        batch_size = 3
-        keep_chain = 2
-        进行0到9的逆向迭代:
-        s_array = [9, 9, 9]
-        t_array = s_array + 1 = [10, 10, 10]
-        将s_array和t_array归一化到0-1区间
-        调用sample_p_zs_given_zt采样,输入归一化后的s, t
-        得到sampled_s和discrete_sampled_s
-        更新采样结果X,E,y
-        write_index = floor(s/steps),在chain_X中保存采样结果
-        重复进行逆向迭代采样
-        最终调用mask处理采样结果
-        更新X,E,y为遮蔽后的采样图
-        """
         for s_int in reversed(range(0, self.T)):
             s_array = s_int * torch.ones((batch_size, 1)).type_as(y)
             t_array = s_array + 1
@@ -626,7 +529,6 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
             t_norm = t_array / self.T
 
             # Sample z_s
-            #逆扩散的最核心逻辑保存在sample_p_zs_given_zt函数中
             sampled_s, discrete_sampled_s = self.sample_p_zs_given_zt(s_norm, t_norm, X, E, y, node_mask)
             X, E, y = sampled_s.X, sampled_s.E, sampled_s.y
             # Save the first keep_chain graphs
@@ -689,20 +591,14 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
 
         return molecule_list
 
-######逆扩散的最核心逻辑！！！！
-    #s就是t-1步
-    #需要加入对Y的采样
-    #该函数仅对非填充节点进行采样，不改变图结构
     def sample_p_zs_given_zt(self, s, t, X_t, E_t, y_t, node_mask):
         """Samples from zs ~ p(zs | zt). Only used during sampling.
            if last_step, return the graph prediction as well"""
         bs, n, dxs = X_t.shape
-        #分别取到alpha和beta
         beta_t = self.noise_schedule(t_normalized=t)  # (bs, 1)
         alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized=s)
         alpha_t_bar = self.noise_schedule.get_alpha_bar(t_normalized=t)
 
-        # Retrieve transitions matrix
         Qtb = self.transition_model.get_Qt_bar(alpha_t_bar, self.device)
         Qsb = self.transition_model.get_Qt_bar(alpha_s_bar, self.device)
         Qt = self.transition_model.get_Qt(beta_t, self.device)
@@ -712,12 +608,6 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
         extra_data = self.compute_extra_data(noisy_data)
         pred = self.forward(noisy_data, extra_data, node_mask)
 
-        #Graphtransformer能够预测出来的是X和E以及Y的分布，而不是具体的值。另外，这里只用到了X和E来生成，Y没有用到。
-        '''所以我们可以在这里生成新的Y，同时不生成新的E，以及设定在生成X的时候对于已经有值的X只是改变X的值，为None的x也不产生新的值，而Y就是一个bool值
-        判断当前这个节点是否属于query节点的相同社区'''
-        '''这样我们就可以实现子图的识别了'''
-        # Normalize predictions
-        # 增加对Y的预测
         pred_X = F.softmax(pred.X, dim=-1)               # bs, n, d0
         pred_E = F.softmax(pred.E, dim=-1)               # bs, n, n, d0
 
