@@ -485,14 +485,12 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
         return self.model(X, E, y, node_mask)
 
     @torch.no_grad()
-    #逆向扩散，生成步骤！！！！！
     def sample_batch(self, batch_id: int, batch_size: int, keep_chain: int, number_chain_steps: int,
                      save_final: int, num_nodes=None):
         if num_nodes is None:
             n_nodes = self.node_dist.sample_n(batch_size, self.device)
         elif type(num_nodes) == int:
             n_nodes = num_nodes * torch.ones(batch_size, device=self.device, dtype=torch.int)
-        #如果num_nodes是一个tensor，则按照tensor中的节点数进行生成!
         else:
             assert isinstance(num_nodes, torch.Tensor)
             n_nodes = num_nodes
